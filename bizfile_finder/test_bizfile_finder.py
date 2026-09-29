@@ -187,3 +187,39 @@ def test_main_sheet_layout_and_compare(tmp_path):
                                                  "FOUND", "NO_FOLDER"]
     assert rows[0]["found_in"] == "Alphabetical: A-C" and rows[3]["found_in"] == "GROUPS"
     assert [r["agrees"] for r in rows] == ["yes", "yes", "", "NO", "yes"]     # Gamma: manual said not done
+
+
+def _snapshot(entries):
+    return sorted((e["path"], tuple(sorted(b[0] for b in e["bizfiles"]))) for e in entries)
+
+
+def test_dijkstra_dfs_and_parallel_give_identical_index():
+    ref = _snapshot(build_index(FakeDrive(tree()), "pte", algo="dfs"))
+    assert _snapshot(build_index(FakeDrive(tree()), "pte", algo="dijkstra")) == ref
+    assert _snapshot(build_index(FakeDrive(tree()), "pte", algo="dijkstra", workers=8)) == ref
+    assert len(ref) > 10
+
+
+def test_dijkstra_settles_shallowest_first():
+    order, depth = [], {"pte": 0}
+
+    class Spy(FakeDrive):
+        def children(self, pid, folders_only=False):
+            order.append(depth[pid])
+            for f in super().children(pid, folders_only):
+                depth.setdefault(f["id"], depth[pid] + 1)
+                yield f
+    build_index(Spy(tree()), "pte", algo="dijkstra")
+    assert order == sorted(order) and max(order) >= 3
+
+
+def test_prune_skips_below_bizfile_folders():
+    t = {"pte": [F("a", "A-C")], "a": [F("c1", "Acme Pte Ltd"), F("c2", "Beta Pte Ltd")],
+         "c1": [D("f", "BIZFILE.pdf"), F("tax", "Tax")], "tax": [F("y", "2023")],
+         "c2": [F("misc", "Misc")], "misc": [D("g", "BIZNET.pdf")]}
+    full, pruned = FakeDrive(t), FakeDrive(t)
+    assert len(build_index(full, "pte")) == 5                 # c1, tax, 2023, c2, misc
+    assert len(build_index(pruned, "pte", prune=True)) == 3   # c1, c2, misc  (tax/2023 skipped)
+    assert pruned.calls < full.calls
+    r = check_client(Index(build_index(pruned, "pte", prune=True)), "Beta Pte Ltd")
+    assert r["check_result"] == "FOUND"                       # bizfile in sub-folder still found

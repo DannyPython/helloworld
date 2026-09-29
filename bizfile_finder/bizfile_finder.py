@@ -6,7 +6,7 @@ document) under the Cosec shared drive, WITHOUT copying anything.
 Method (read-only; only names are listed, nothing is downloaded/modified):
     Folders under  Secretarial Work -> CLIENTS (Corp Sec) -> PTE Company  are filed inconsistently
     (A-C, D-F ... Y-Z, GROUPS, sub-folders inside those, ...), so the program does a full
-    depth-first walk of EVERY sub-folder at every depth, indexes each folder plus the
+    walk (Dijkstra, shallowest first, listing folders in parallel) of EVERY sub-folder at every depth, indexes each folder plus the
     BIZFILE/BIZNET files sitting in it, then looks for the client's folder anywhere in that index.
     If a name exists in several places, the copy that has a bizfile wins, then alphabetical over
     GROUPS, then latest FY, then shallowest; all other locations are listed in `note`.
@@ -27,10 +27,13 @@ import argparse
 import bisect
 import csv
 import difflib
+import heapq
 import os
 import re
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
@@ -91,9 +94,23 @@ def is_bizfile(name: str) -> bool:
 class Drive:
     """Thin read-only wrapper: every call is a files.list on a single parent."""
 
-    def __init__(self, service):
-        self.svc = service
+    def __init__(self, service_factory):
+        """service_factory() -> a NEW googleapiclient service. The library is not thread-safe,
+        so every worker thread lazily builds and keeps its own."""
+        self._factory = service_factory
+        self._local = threading.local()
+        self._lock = threading.Lock()
         self.calls = 0
+
+    @property
+    def svc(self):
+        if not hasattr(self._local, "svc"):
+            self._local.svc = self._factory()
+        return self._local.svc
+
+    def _count(self):
+        with self._lock:
+            self.calls += 1
 
     def children(self, parent_id, folders_only=False):
         q = f"'{parent_id}' in parents and trashed = false"
@@ -101,7 +118,7 @@ class Drive:
             q += f" and mimeType = '{FOLDER_MIME}'"
         token = None
         while True:
-            self.calls += 1
+            self._count()
             r = self.svc.files().list(
                 q=q, pageSize=1000, pageToken=token,
                 fields="nextPageToken, files(id, name, mimeType, webViewLink, modifiedTime)",
@@ -123,7 +140,7 @@ class Drive:
             kw.update(corpora="drive", driveId=drive_id)
         else:
             kw.update(corpora="allDrives")
-        self.calls += 1
+        self._count()
         return self.svc.files().list(**kw).execute().get("files", [])
 
 
@@ -132,9 +149,11 @@ class LocalDrive:
     Only lists names via os.scandir; file contents are never opened, so nothing is
     downloaded in Stream mode. Ids are absolute paths."""
     calls = 0
+    _lock = threading.Lock()
 
     def children(self, parent_id, folders_only=False):
-        self.calls += 1
+        with self._lock:
+            self.calls += 1
         try:
             entries = sorted(os.scandir(parent_id), key=lambda e: e.name)
         except OSError as exc:
@@ -185,6 +204,7 @@ def _safe_scandir(path):
 
 
 def build_service(credentials_file, token_file):
+    """Authenticate once; returns a factory that builds a fresh Drive service per thread."""
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
     from google_auth_oauthlib.flow import InstalledAppFlow
@@ -200,7 +220,7 @@ def build_service(credentials_file, token_file):
             creds = InstalledAppFlow.from_client_secrets_file(
                 credentials_file, SCOPES).run_local_server(port=0)
         Path(token_file).write_text(creds.to_json())
-    return build("drive", "v3", credentials=creds, cache_discovery=False)
+    return lambda: build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
 # --------------------------------------------------------------- index build
@@ -252,31 +272,50 @@ def _entry(f, parts, location):
                 link=f.get("webViewLink") or f"https://drive.google.com/drive/folders/{f['id']}")
 
 
-def build_index(drive, root_id: str, seen=None, max_depth=None, progress_every=0):
+def _scan(drive, pid):
+    """One listing -> (sub-folders, [(bizfile name, link, modified)]). Thread-safe."""
+    subs, biz = [], []
+    for k in sorted(drive.children(pid), key=lambda k: k["name"].lower()):
+        if k["mimeType"] == FOLDER_MIME:
+            subs.append(k)
+        elif is_bizfile(k["name"]):
+            biz.append((k["name"], k.get("webViewLink", ""), k.get("modifiedTime", "")))
+    return subs, biz
+
+
+def build_index(drive, root_id: str, seen=None, max_depth=None, progress_every=0,
+                algo="dijkstra", workers=1, prune=False):
     """
-    Iterative DFS over EVERY folder below PTE Company (range folders A-C.., GROUPS, anything
-    else, at any depth). One listing per folder; metadata only, nothing is opened/downloaded.
+    Walk EVERY folder below PTE Company (range folders A-C.., GROUPS, anything else, any depth).
+    One listing per folder; metadata only, nothing is opened/downloaded.
     Each folder becomes an entry {name, path, location, found_in, link, bizfiles=[...]} where
-    bizfiles are the BIZFILE/BIZNET *files sitting directly in that folder*.
-    The range folders / GROUPS themselves are containers, not companies, so they are not indexed.
+    bizfiles are the BIZFILE/BIZNET *files sitting directly in that folder*. The range folders /
+    GROUPS themselves are containers, not companies, so they are not indexed.
+
+    algo="dijkstra": priority queue keyed by cost = depth (every folder step costs 1), so folders
+        are settled shallowest-first. All folders at the same cost are independent, so they are
+        listed concurrently by `workers` threads - that is where the speed-up comes from
+        (listing latency, not traversal order, is the bottleneck).
+    algo="dfs": the old depth-first order (kept for comparison).
+    prune=True: do not descend below a folder that directly contains a BIZFILE/BIZNET file
+        (a company folder's own sub-folders - Tax, Accounts, years... - hold no other clients).
     """
-    entries, visited, scanned, t0 = [], {root_id}, 0, time.time()
-    stack = [(root_id, [], None)]                       # (folder id, path parts, entry)
-    while stack:
-        pid, parts, entry = stack.pop()
-        subs = []
-        for k in sorted(drive.children(pid), key=lambda k: k["name"].lower()):
-            if k["mimeType"] == FOLDER_MIME:
-                subs.append(k)
-            elif entry is not None and is_bizfile(k["name"]):
-                entry["bizfiles"].append((k["name"], k.get("webViewLink", ""), k.get("modifiedTime", "")))
-        scanned += 1
-        if progress_every and scanned % progress_every == 0:
-            print(f"  ... {scanned} folders scanned ({time.time() - t0:.0f}s)", file=sys.stderr)
-        if max_depth is not None and len(parts) >= max_depth:
-            continue
-        for k in reversed(subs):                        # reversed -> visits in name order
-            if k["id"] in visited:
+    entries, visited, t0 = [], {root_id}, time.time()
+    state = dict(scanned=0)
+
+    def visit(item, subs, biz):
+        """Apply one finished listing; return the child work items to schedule."""
+        _, _, _, parts, entry = item
+        if entry is not None:
+            entry["bizfiles"].extend(biz)
+        state["scanned"] += 1
+        if progress_every and state["scanned"] % progress_every == 0:
+            print(f"  ... {state['scanned']} folders scanned ({time.time() - t0:.0f}s)", file=sys.stderr)
+        if (max_depth is not None and len(parts) >= max_depth) or (prune and biz):
+            return []
+        kids = []
+        for k in subs:
+            if k["id"] in visited:            # cycle / duplicate-parent guard
                 continue
             visited.add(k["id"])
             kparts = parts + [k["name"]]
@@ -287,7 +326,34 @@ def build_index(drive, root_id: str, seen=None, max_depth=None, progress_every=0
             if not (len(kparts) == 1 and loc in (ALPHA, GROUPS)):
                 e = _entry(k, kparts, loc)
                 entries.append(e)
-            stack.append((k["id"], kparts, e))
+            kids.append((len(kparts), "/".join(kparts).lower(), k["id"], kparts, e))
+        return kids
+
+    root = (0, "", root_id, [], None)          # (cost, tie-break, folder id, path parts, entry)
+    pool = ThreadPoolExecutor(max_workers=workers) if workers > 1 else None
+    try:
+        if algo == "dfs":
+            stack = [root]
+            while stack:
+                item = stack.pop()
+                subs, biz = _scan(drive, item[2])
+                stack.extend(reversed(visit(item, subs, biz)))
+        else:
+            heap = [root]
+            while heap:
+                cost = heap[0][0]
+                batch = []
+                while heap and heap[0][0] == cost:       # every folder at the minimum cost
+                    batch.append(heapq.heappop(heap))
+                ids = [it[2] for it in batch]
+                results = pool.map(lambda pid: _scan(drive, pid), ids) if pool else map(
+                    lambda pid: _scan(drive, pid), ids)
+                for item, (subs, biz) in zip(batch, results):
+                    for kid in visit(item, subs, biz):
+                        heapq.heappush(heap, kid)
+    finally:
+        if pool:
+            pool.shutdown()
     return entries
 
 
@@ -424,6 +490,12 @@ def main(argv=None):
                          "row and report where the program disagrees")
     ap.add_argument("--shared-drive-id", help="ID of the shared drive holding 'Secretarial Work'")
     ap.add_argument("--pte-folder-id", help="ID of the 'PTE Company' folder (skips path lookup)")
+    ap.add_argument("--algo", choices=("dijkstra", "dfs"), default="dijkstra",
+                    help="folder traversal order (default dijkstra = shallowest first)")
+    ap.add_argument("--workers", type=int, default=8,
+                    help="folders listed concurrently (default 8; use 1 to disable parallelism)")
+    ap.add_argument("--prune", action="store_true",
+                    help="do not descend below a folder that directly contains BIZFILE/BIZNET (faster)")
     ap.add_argument("--max-depth", type=int, help="optional safety limit on folder depth below PTE Company")
     ap.add_argument("--dump-folders", metavar="FILE",
                     help="write every folder path visited to FILE (for diagnosing 0 matches)")
@@ -445,11 +517,12 @@ def main(argv=None):
     print("Indexing folder names (read-only)...", file=sys.stderr)
     seen = []
     t0 = time.time()
-    index = Index(build_index(drive, pte, seen=seen, max_depth=a.max_depth, progress_every=500))
+    index = Index(build_index(drive, pte, seen=seen, max_depth=a.max_depth, progress_every=500,
+                              algo=a.algo, workers=max(1, a.workers), prune=a.prune))
     tops = sorted({p.split("/")[0] for p in seen})
     print(f"Top-level folders: {', '.join(tops)}", file=sys.stderr)
     print(f"Scanned {len(seen)} folders in {drive.calls} listings, {time.time() - t0:.0f}s "
-          f"(full DFS, metadata only)", file=sys.stderr)
+          f"({a.algo}, {a.workers} workers, metadata only)", file=sys.stderr)
     if a.dump_folders:
         Path(a.dump_folders).write_text("\n".join(seen), encoding="utf-8")
         print(f"Wrote folder names seen to {a.dump_folders}", file=sys.stderr)
