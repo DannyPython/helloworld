@@ -56,6 +56,21 @@ def fy_of(name: str) -> int:
     return y + 2000 if y < 100 else y
 
 
+FKA_RE = re.compile(r"\(\s*(?:f\.?k\.?a\.?|formerly(?: known as)?)\s*:?\s*(.+?)\s*\)", re.I)
+JUNK_NAMES = {"client name", "client", "name", "organization", "organisation"}
+
+
+def name_variants(client: str):
+    """'New Co (f.k.a. Old Co)' -> ['New Co', 'Old Co']; the folder may carry either name."""
+    variants = [FKA_RE.sub("", client).strip()]
+    variants += [m.strip() for m in FKA_RE.findall(client)]
+    return [v for v in variants if v]
+
+
+def is_junk(name: str) -> bool:
+    return len(name) < 3 or name.lower() in JUNK_NAMES
+
+
 def is_bizfile(name: str) -> bool:
     return bool(re.search(r"biz\s*file|biz\s*net", name, re.I))
 
@@ -164,18 +179,21 @@ class Index:
             self.by_key.setdefault(normalize(e["name"]), []).append(e)
 
     def lookup(self, client):
-        """-> (match_type, [entries]) ; entries sorted latest FY first."""
-        key = normalize(client)
-        if key in self.by_key:
-            return "EXACT", sorted(self.by_key[key], key=lambda e: -fy_of(e["name"]))
-        close = difflib.get_close_matches(key, self.by_key, n=1, cutoff=FUZZY_THRESHOLD)
-        if close:
-            return "FUZZY", sorted(self.by_key[close[0]], key=lambda e: -fy_of(e["name"]))
+        """-> (match_type, [entries]) ; entries sorted latest FY first.
+        Tries every name variant (current + f.k.a.) exact first, then fuzzy."""
+        keys = [normalize(v) for v in name_variants(client)]
+        for key in keys:
+            if key in self.by_key:
+                return "EXACT", sorted(self.by_key[key], key=lambda e: -fy_of(e["name"]))
+        for key in keys:
+            close = difflib.get_close_matches(key, self.by_key, n=1, cutoff=FUZZY_THRESHOLD)
+            if close:
+                return "FUZZY", sorted(self.by_key[close[0]], key=lambda e: -fy_of(e["name"]))
         return "NONE", []
 
 
 # ------------------------------------------------------------------- driver
-def read_clients(path, column=None):
+def read_clients(path, column=None, skip_done=False):
     with open(path, newline="", encoding="utf-8-sig") as fh:
         rows = list(csv.DictReader(fh))
     if not rows:
@@ -186,7 +204,17 @@ def read_clients(path, column=None):
         print(f"Using name column: {column!r}", file=sys.stderr)
     elif column not in cols:
         sys.exit(f"Column {column!r} not in CSV. Available: {cols}")
-    return [r[column].strip() for r in rows if r[column].strip()]
+    status_col = next((c for c in cols if c.strip().lower() == "status"), None)
+    names, seen = [], set()
+    for r in rows:
+        n = r[column].strip()
+        if is_junk(n) or n.lower() in seen:
+            continue
+        if skip_done and status_col and r[status_col].strip().lower() == "done":
+            continue
+        seen.add(n.lower())
+        names.append(n)
+    return names
 
 
 def check_client(drive, index, client):
@@ -222,13 +250,15 @@ def main(argv=None):
     ap.add_argument("csv")
     ap.add_argument("-o", "--output", default="bizfile_results.csv")
     ap.add_argument("--name-column")
+    ap.add_argument("--skip-done", action="store_true",
+                    help="skip rows whose Status column is already 'Done'")
     ap.add_argument("--shared-drive-id", help="ID of the shared drive holding 'Secretarial Work'")
     ap.add_argument("--pte-folder-id", help="ID of the 'PTE Company' folder (skips path lookup)")
     ap.add_argument("--credentials", default="credentials.json", help="OAuth client secrets")
     ap.add_argument("--token", default="token.json")
     a = ap.parse_args(argv)
 
-    clients = read_clients(a.csv, a.name_column)
+    clients = read_clients(a.csv, a.name_column, a.skip_done)
     drive = Drive(build_service(a.credentials, a.token))
     pte = resolve_pte_root(drive, a.shared_drive_id, a.pte_folder_id)
     print("Indexing folder names (read-only)...", file=sys.stderr)

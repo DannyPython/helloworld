@@ -34,3 +34,17 @@ def test_all():
     assert z["status"] == "FOUND" and z["location"] == "GROUP"
     assert check_client(d, idx, "Nonexistent Co")["status"] == "NO_FOLDER"
     assert check_client(d, idx, "Alpha Holding Pte Ltd")["status"] == "FOUND_FUZZY_REVIEW"
+
+
+def test_fka_and_junk(tmp_path):
+    assert name_variants("Blue Monk Pte. Ltd. (f.k.a. Atelier Pte. Ltd.)") == \
+        ["Blue Monk Pte. Ltd.", "Atelier Pte. Ltd."]
+    tree = {"pte": [F("a", "A")], "a": [F("c1", "Atelier Pte Ltd - FY06")],
+            "c1": [D("f0", "BIZFILE.pdf")]}
+    d = FakeDrive(tree)
+    idx = Index(build_index(d, "pte"))
+    assert check_client(d, idx, "Blue Monk Pte. Ltd. (f.k.a. Atelier Pte. Ltd.)")["status"] == "FOUND"
+    p = tmp_path / "c.csv"
+    p.write_text("Client Name (x),Status,Link\nClient Name,,\nl,,\nAcme Pte Ltd,Done,u\nBeta Pte Ltd,,\n")
+    assert read_clients(str(p)) == ["Acme Pte Ltd", "Beta Pte Ltd"]
+    assert read_clients(str(p), skip_done=True) == ["Beta Pte Ltd"]
