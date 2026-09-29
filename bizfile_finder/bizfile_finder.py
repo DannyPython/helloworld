@@ -12,12 +12,15 @@ Input : CSV with the client names (column auto-detected or --name-column).
 Output: CSV with status, folder link, bizfile link per client.
 
 Usage:
-    python bizfile_finder.py clients.csv -o results.csv
+    python bizfile_finder.py clients.csv --local-root "G:\\Shared drives\\X\\Secretarial Work\\CLIENTS (Corp Sec)\\PTE Company"
+        (Google Drive for Desktop, Stream mode: no credentials.json / token.json)
+    python bizfile_finder.py clients.csv -o results.csv   (Drive API, needs credentials.json)
     python bizfile_finder.py clients.csv --name-column "Organization Name"
 """
 import argparse
 import csv
 import difflib
+import os
 import re
 import sys
 from pathlib import Path
@@ -113,6 +116,29 @@ class Drive:
             kw.update(corpora="allDrives")
         self.calls += 1
         return self.svc.files().list(**kw).execute().get("files", [])
+
+
+class LocalDrive:
+    """Same interface as Drive, but walks a Drive-for-Desktop mount (e.g. G:\\Shared drives\\...).
+    Only lists names via os.scandir; file contents are never opened, so nothing is
+    downloaded in Stream mode. Ids are absolute paths."""
+    calls = 0
+
+    def children(self, parent_id, folders_only=False):
+        self.calls += 1
+        try:
+            entries = sorted(os.scandir(parent_id), key=lambda e: e.name)
+        except OSError as exc:
+            print(f"warning: cannot list {parent_id}: {exc}", file=sys.stderr)
+            return
+        for e in entries:
+            if e.name.startswith("."):
+                continue
+            is_dir = e.is_dir()
+            if folders_only and not is_dir:
+                continue
+            yield dict(id=e.path, name=e.name, webViewLink=e.path,
+                       mimeType=FOLDER_MIME if is_dir else "file")
 
 
 def build_service(credentials_file, token_file):
@@ -254,13 +280,20 @@ def main(argv=None):
                     help="skip rows whose Status column is already 'Done'")
     ap.add_argument("--shared-drive-id", help="ID of the shared drive holding 'Secretarial Work'")
     ap.add_argument("--pte-folder-id", help="ID of the 'PTE Company' folder (skips path lookup)")
+    ap.add_argument("--local-root", help="path to the 'PTE Company' folder as mounted by Google "
+                    "Drive for Desktop (Stream mode). No credentials/token needed.")
     ap.add_argument("--credentials", default="credentials.json", help="OAuth client secrets")
     ap.add_argument("--token", default="token.json")
     a = ap.parse_args(argv)
 
     clients = read_clients(a.csv, a.name_column, a.skip_done)
-    drive = Drive(build_service(a.credentials, a.token))
-    pte = resolve_pte_root(drive, a.shared_drive_id, a.pte_folder_id)
+    if a.local_root:
+        if not os.path.isdir(a.local_root):
+            sys.exit(f"--local-root is not a folder: {a.local_root!r}")
+        drive, pte = LocalDrive(), a.local_root
+    else:
+        drive = Drive(build_service(a.credentials, a.token))
+        pte = resolve_pte_root(drive, a.shared_drive_id, a.pte_folder_id)
     print("Indexing folder names (read-only)...", file=sys.stderr)
     index = Index(build_index(drive, pte))
     print(f"Indexed {sum(map(len, index.by_key.values()))} client folders "

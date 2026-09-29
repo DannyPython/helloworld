@@ -48,3 +48,15 @@ def test_fka_and_junk(tmp_path):
     p.write_text("Client Name (x),Status,Link\nClient Name,,\nl,,\nAcme Pte Ltd,Done,u\nBeta Pte Ltd,,\n")
     assert read_clients(str(p)) == ["Acme Pte Ltd", "Beta Pte Ltd"]
     assert read_clients(str(p), skip_done=True) == ["Beta Pte Ltd"]
+
+
+def test_local_drive(tmp_path):
+    g = tmp_path / "PTE Company"
+    (g / "A" / "Alpha Pte Ltd - FY12").mkdir(parents=True)
+    (g / "A" / "Alpha Pte Ltd - FY12" / "BIZFILE.pdf").write_text("x")
+    (g / "GROUP" / "Grp" / "Zeta Pte Ltd - FY03").mkdir(parents=True)
+    d = LocalDrive()
+    idx = Index(build_index(d, str(g)))
+    assert check_client(d, idx, "Alpha Pte. Ltd.")["status"] == "FOUND"
+    z = check_client(d, idx, "Zeta Pte. Ltd.")
+    assert z["status"] == "NO_BIZFILE" and z["location"] == "GROUP"
