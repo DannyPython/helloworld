@@ -3,11 +3,13 @@
 Check which Client-Current organisations have a folder (and a BIZFILE/BIZNET
 document) under the Cosec shared drive, WITHOUT copying anything.
 
-Drive layout (read-only; only names are listed, nothing is downloaded/modified):
-    Secretarial Work -> CLIENTS (Corp Sec) -> PTE Company
-        -> A-C, D-F, G-I, J-L, M-O, P-R, S-U, V-X, Y-Z  / <company folder>   (searched first)
-        -> GROUPS / <company folder>                                        (fallback only)
-            -> BIZFILE / BIZNET file
+Method (read-only; only names are listed, nothing is downloaded/modified):
+    Folders under  Secretarial Work -> CLIENTS (Corp Sec) -> PTE Company  are filed inconsistently
+    (A-C, D-F ... Y-Z, GROUPS, sub-folders inside those, ...), so the program does a full
+    depth-first walk of EVERY sub-folder at every depth, indexes each folder plus the
+    BIZFILE/BIZNET files sitting in it, then looks for the client's folder anywhere in that index.
+    If a name exists in several places, the copy that has a bizfile wins, then alphabetical over
+    GROUPS, then latest FY, then shallowest; all other locations are listed in `note`.
 
 Input : the client CSV (same layout as the Google Sheet:
         Client Name | Status | Connected folder link).
@@ -22,11 +24,14 @@ Usage:
     python bizfile_finder.py clients.csv --local-root "H:/" --compare             # check against manual Status
 """
 import argparse
+import bisect
 import csv
 import difflib
 import os
 import re
 import sys
+import time
+from datetime import datetime
 from pathlib import Path
 
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]  # read-only on purpose
@@ -99,7 +104,7 @@ class Drive:
             self.calls += 1
             r = self.svc.files().list(
                 q=q, pageSize=1000, pageToken=token,
-                fields="nextPageToken, files(id, name, mimeType, webViewLink)",
+                fields="nextPageToken, files(id, name, mimeType, webViewLink, modifiedTime)",
                 supportsAllDrives=True, includeItemsFromAllDrives=True,
             ).execute()
             yield from r.get("files", [])
@@ -138,11 +143,20 @@ class LocalDrive:
         for e in entries:
             if e.name.startswith("."):
                 continue
-            is_dir = e.is_dir()
+            try:
+                is_dir = e.is_dir(follow_symlinks=False)   # never follow links (no cycles)
+            except OSError:
+                continue
             if folders_only and not is_dir:
                 continue
-            yield dict(id=e.path, name=e.name, webViewLink=e.path,
-                       mimeType=FOLDER_MIME if is_dir else "file")
+            item = dict(id=e.path, name=e.name, webViewLink=e.path,
+                        mimeType=FOLDER_MIME if is_dir else "file")
+            if not is_dir and is_bizfile(e.name):           # only these are ever stat'ed
+                try:
+                    item["modifiedTime"] = datetime.fromtimestamp(e.stat().st_mtime).isoformat()
+                except OSError:
+                    pass
+            yield item
 
 
 def resolve_local_root(root: str) -> str:
@@ -206,7 +220,8 @@ def resolve_pte_root(drive: Drive, shared_drive_id=None, pte_folder_id=None):
     return parent
 
 
-ALPHA, GROUPS = "ALPHABETICAL", "GROUPS"
+ALPHA, GROUPS, OTHER = "ALPHABETICAL", "GROUPS", "OTHER"
+LOC_RANK = {ALPHA: 0, GROUPS: 1, OTHER: 2}
 GROUPS_RE = re.compile(r"^\s*groups?\s*$", re.I)
 RANGE_RE = re.compile(r"^\s*[A-Za-z]\s*[-–]\s*[A-Za-z]\s*$")     # A-C, D-F, ...
 ROMAN_RE = re.compile(r"^[ivx]+$")
@@ -222,74 +237,102 @@ def confusable(a: str, b: str) -> bool:
     return marks(a) != marks(b)
 
 
-def _entry(f, path, location):
-    parts = path.split("/")
-    if location == ALPHA:
-        found_in = f"Alphabetical: {parts[0]}"
-    else:
-        found_in = "GROUPS" + (f" > {parts[1]}" if len(parts) > 2 else "")
-    return dict(id=f["id"], name=f["name"], path=path, location=location, found_in=found_in,
+def classify(top: str) -> str:
+    if GROUPS_RE.match(top):
+        return GROUPS
+    return ALPHA if RANGE_RE.match(top) else OTHER
+
+
+def _entry(f, parts, location):
+    path = "/".join(parts)
+    label = {ALPHA: f"Alphabetical: {parts[0]}", GROUPS: "GROUPS"}.get(location, f"Other: {parts[0]}")
+    inner = "/".join(parts[1:-1])
+    return dict(id=f["id"], name=f["name"], path=path, depth=len(parts), location=location,
+                found_in=label + (f" > {inner}" if inner else ""), bizfiles=[],
                 link=f.get("webViewLink") or f"https://drive.google.com/drive/folders/{f['id']}")
 
 
-def build_index(drive: Drive, pte_id: str, seen=None):
+def build_index(drive, root_id: str, seen=None, max_depth=None, progress_every=0):
     """
-    PTE Company
-      +- <alphabetical range folders: A-C, D-E, ...> / <company folder>   -> ALPHABETICAL
-      +- GROUPS / <company folder>  (or GROUPS / <group> / <company>)     -> GROUPS
-    Folders only, metadata only. Client folders are NOT required to carry an FY suffix.
-    Returns a list of dicts {id, name, path, location, link}.
+    Iterative DFS over EVERY folder below PTE Company (range folders A-C.., GROUPS, anything
+    else, at any depth). One listing per folder; metadata only, nothing is opened/downloaded.
+    Each folder becomes an entry {name, path, location, found_in, link, bizfiles=[...]} where
+    bizfiles are the BIZFILE/BIZNET *files sitting directly in that folder*.
+    The range folders / GROUPS themselves are containers, not companies, so they are not indexed.
     """
-    found = []
-    for top in drive.children(pte_id, folders_only=True):
-        is_groups = bool(GROUPS_RE.match(top["name"]))
-        if seen is not None:
-            seen.append(top["name"])
-        if not is_groups and not RANGE_RE.match(top["name"]):
-            print(f"warning: ignoring unexpected folder under PTE Company: {top['name']!r}",
-                  file=sys.stderr)
+    entries, visited, scanned, t0 = [], {root_id}, 0, time.time()
+    stack = [(root_id, [], None)]                       # (folder id, path parts, entry)
+    while stack:
+        pid, parts, entry = stack.pop()
+        subs = []
+        for k in sorted(drive.children(pid), key=lambda k: k["name"].lower()):
+            if k["mimeType"] == FOLDER_MIME:
+                subs.append(k)
+            elif entry is not None and is_bizfile(k["name"]):
+                entry["bizfiles"].append((k["name"], k.get("webViewLink", ""), k.get("modifiedTime", "")))
+        scanned += 1
+        if progress_every and scanned % progress_every == 0:
+            print(f"  ... {scanned} folders scanned ({time.time() - t0:.0f}s)", file=sys.stderr)
+        if max_depth is not None and len(parts) >= max_depth:
             continue
-        loc = GROUPS if is_groups else ALPHA
-        for f in drive.children(top["id"], folders_only=True):
-            path = f"{top['name']}/{f['name']}"
+        for k in reversed(subs):                        # reversed -> visits in name order
+            if k["id"] in visited:
+                continue
+            visited.add(k["id"])
+            kparts = parts + [k["name"]]
             if seen is not None:
-                seen.append(path)
-            found.append(_entry(f, path, loc))
-            if is_groups:  # tolerate GROUPS/<group name>/<company>
-                for g in drive.children(f["id"], folders_only=True):
-                    gpath = f"{path}/{g['name']}"
-                    if seen is not None:
-                        seen.append(gpath)
-                    found.append(_entry(g, gpath, GROUPS))
-    return found
+                seen.append("/".join(kparts))
+            loc = classify(kparts[0])
+            e = None
+            if not (len(kparts) == 1 and loc in (ALPHA, GROUPS)):
+                e = _entry(k, kparts, loc)
+                entries.append(e)
+            stack.append((k["id"], kparts, e))
+    return entries
 
 
 class Index:
-    """Two pools searched in order: alphabetical folders first, GROUPS only as fallback."""
-
     def __init__(self, entries):
-        self.pools = {ALPHA: {}, GROUPS: {}}
+        self.by_key = {}
         for e in entries:
-            self.pools[e["location"]].setdefault(normalize(e["name"]), []).append(e)
+            self.by_key.setdefault(normalize(e["name"]), []).append(e)
+        self._sorted = sorted(entries, key=lambda e: e["path"])
+        self._paths = [e["path"] for e in self._sorted]
+        self.size = len(entries)
 
-    @property
-    def size(self):
-        return sum(len(v) for pool in self.pools.values() for v in pool.values())
+    def descendants(self, e):
+        prefix = e["path"] + "/"
+        i = bisect.bisect_left(self._paths, prefix)
+        while i < len(self._paths) and self._paths[i].startswith(prefix):
+            yield self._sorted[i]
+            i += 1
+
+    def bizfiles_of(self, e):
+        """(files, relative_subpath): files directly in the folder, else those in its
+        shallowest descendant folder that has any."""
+        if e["bizfiles"]:
+            return e["bizfiles"], ""
+        subs = sorted((d for d in self.descendants(e) if d["bizfiles"]),
+                      key=lambda d: (d["depth"], d["path"]))
+        if subs:
+            return subs[0]["bizfiles"], subs[0]["path"][len(e["path"]) + 1:]
+        return [], ""
+
+    def rank(self, e):
+        files, _ = self.bizfiles_of(e)
+        return (0 if files else 1, LOC_RANK[e["location"]], -fy_of(e["name"]), e["depth"], e["path"])
 
     def lookup(self, client):
-        """-> (match_type, [entries]) ; entries sorted latest FY first.
-        Per pool (ALPHABETICAL, then GROUPS): exact on every name variant
-        (current + f.k.a.), then fuzzy."""
+        """-> (match_type, entries) over ALL folders at any depth. Exact on every name variant
+        (current + f.k.a.) first, then guarded fuzzy."""
         keys = [normalize(v) for v in name_variants(client)]
-        for loc in (ALPHA, GROUPS):
-            pool = self.pools[loc]
-            for key in keys:
-                if key in pool:
-                    return "EXACT", sorted(pool[key], key=lambda e: -fy_of(e["name"]))
-            for key in keys:
-                for cand in difflib.get_close_matches(key, pool, n=5, cutoff=FUZZY_THRESHOLD):
-                    if not confusable(key, cand):
-                        return "FUZZY", sorted(pool[cand], key=lambda e: -fy_of(e["name"]))
+        for key in keys:
+            if key in self.by_key:
+                return "EXACT", list(self.by_key[key])
+        for key in keys:
+            for cand in difflib.get_close_matches(key, self.by_key, n=5, cutoff=FUZZY_THRESHOLD):
+                if not confusable(key, cand):
+                    return "FUZZY", list(self.by_key[cand])
         return "NONE", []
 
 
@@ -335,7 +378,7 @@ def read_clients(path, column=None, skip_done=False):
             and not (skip_done and r["status"].lower() == "done")]
 
 
-def check_client(drive, index, client):
+def check_client(index, client):
     res = dict(client=client, check_result="", match_type="", found_in="", matched_folder="",
                matched_path="", location="", folder_link="", bizfile_name="", bizfile_link="",
                note="")
@@ -343,32 +386,27 @@ def check_client(drive, index, client):
     if not entries:
         res["check_result"] = "NO_FOLDER"
         return res
-    top = entries[0]
+    ranked = sorted(entries, key=index.rank)            # bizfile present > alphabetical > GROUPS > latest FY > shallow
+    top = ranked[0]
     res.update(match_type=mtype, matched_folder=top["name"], matched_path=top["path"],
                location=top["location"], found_in=top["found_in"], folder_link=top["link"])
     notes = []
-    if len(entries) > 1:
-        notes.append("multiple folders: " + "; ".join(e["path"] for e in entries))
-    # list only the matched folder (few calls, nothing downloaded)
-    kids = list(drive.children(top["id"]))
-    files = [f for f in kids if is_bizfile(f["name"]) and f["mimeType"] != FOLDER_MIME]
-    if not files:  # tolerate BIZFILE/ BIZNET sub-folder
-        for sub in (k for k in kids if k["mimeType"] == FOLDER_MIME and is_bizfile(k["name"])):
-            files += [f for f in drive.children(sub["id"]) if f["mimeType"] != FOLDER_MIME]
-            if files:
-                notes.append(f"bizfile found inside sub-folder {sub['name']!r}")
-                break
+    if len(ranked) > 1:
+        notes.append("other folders with this name: " + "; ".join(e["path"] for e in ranked[1:]))
+    files, sub = index.bizfiles_of(top)
     if not files:
         res["check_result"] = "NO_BIZFILE"            # flag: bizfile missing
         res["note"] = " | ".join(notes)
         return res
-    files.sort(key=lambda f: f["name"])
-    res.update(bizfile_name=files[0]["name"], bizfile_link=files[0].get("webViewLink", ""))
+    if sub:
+        notes.append(f"bizfile found in sub-folder {sub!r}")
+    files = sorted(files, key=lambda f: (f[2], f[0]), reverse=True)   # newest first
+    res.update(bizfile_name=files[0][0], bizfile_link=files[0][1])
     res["check_result"] = "FOUND" if mtype == "EXACT" else "FOUND_FUZZY_REVIEW"
     if mtype != "EXACT":
         notes.append("name only approximately matches - verify before connecting")
     if len(files) > 1:
-        notes.append("multiple bizfiles: " + "; ".join(f["name"] for f in files))
+        notes.append("multiple bizfiles (newest used): " + "; ".join(f[0] for f in files))
     res["note"] = " | ".join(notes)
     return res
 
@@ -386,6 +424,7 @@ def main(argv=None):
                          "row and report where the program disagrees")
     ap.add_argument("--shared-drive-id", help="ID of the shared drive holding 'Secretarial Work'")
     ap.add_argument("--pte-folder-id", help="ID of the 'PTE Company' folder (skips path lookup)")
+    ap.add_argument("--max-depth", type=int, help="optional safety limit on folder depth below PTE Company")
     ap.add_argument("--dump-folders", metavar="FILE",
                     help="write every folder path visited to FILE (for diagnosing 0 matches)")
     ap.add_argument("--local-root", help="path to the drive (e.g. H:/) or to the 'PTE Company' folder "
@@ -405,22 +444,22 @@ def main(argv=None):
         pte = resolve_pte_root(drive, a.shared_drive_id, a.pte_folder_id)
     print("Indexing folder names (read-only)...", file=sys.stderr)
     seen = []
-    index = Index(build_index(drive, pte, seen=seen))
+    t0 = time.time()
+    index = Index(build_index(drive, pte, seen=seen, max_depth=a.max_depth, progress_every=500))
     tops = sorted({p.split("/")[0] for p in seen})
     print(f"Top-level folders: {', '.join(tops)}", file=sys.stderr)
-    print(f"Indexed {index.size} company folders (of {len(seen)} folders seen) "
-          f"in {drive.calls} listing calls", file=sys.stderr)
+    print(f"Scanned {len(seen)} folders in {drive.calls} listings, {time.time() - t0:.0f}s "
+          f"(full DFS, metadata only)", file=sys.stderr)
     if a.dump_folders:
         Path(a.dump_folders).write_text("\n".join(seen), encoding="utf-8")
         print(f"Wrote folder names seen to {a.dump_folders}", file=sys.stderr)
     n_todo = sum(1 for r in rows if not r["skip"])
     if index.size < max(1, n_todo // 4):
-        print("\nWARNING: very few company folders recognised. Folder names seen "
+        print("\nWARNING: very few folders found. Folder names seen "
               f"(first 25 of {len(seen)}):", file=sys.stderr)
         for x in seen[:25]:
             print("   ", x, file=sys.stderr)
-        print("Expected: PTE Company/<A-C ...>/<company> and PTE Company/GROUPS/<company>. "
-              "Check the 'Using PTE Company folder' line, or use --dump-folders.\n", file=sys.stderr)
+        print("Check the 'Using PTE Company folder' line, or use --dump-folders.\n", file=sys.stderr)
 
     fields = [name_col, status_col, link_col, "check_result", "found_in", "matched_folder",
               "matched_path", "match_type", "bizfile_name", "bizfile_link", "note"]
@@ -436,7 +475,7 @@ def main(argv=None):
             res = dict(client=r["name"], check_result="SKIPPED_ALREADY_DONE")
             status, link = r["status"], r["link"]
         else:
-            res = check_client(drive, index, r["name"])
+            res = check_client(index, r["name"])
             status = STATUS_DONE if res["check_result"] == "FOUND" else STATUS_TODO
             link = res["folder_link"]
         row = {name_col: r["name"], status_col: status, link_col: link}
