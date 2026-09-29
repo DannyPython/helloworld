@@ -3,20 +3,23 @@
 Check which Client-Current organisations have a folder (and a BIZFILE/BIZNET
 document) under the Cosec shared drive, WITHOUT copying anything.
 
-Drive path walked (read-only, metadata only, nothing is downloaded/modified):
-    Shared Drive -> Secretarial Work -> CLIENTS (Corp Sec) -> PTE Company
-        -> <alphabetical range folders, e.g. A-C> / <company folder>
-       (fallback only if not found there: PTE Company -> GROUPS -> <company folder>)
+Drive layout (read-only; only names are listed, nothing is downloaded/modified):
+    Secretarial Work -> CLIENTS (Corp Sec) -> PTE Company
+        -> A-C, D-F, G-I, J-L, M-O, P-R, S-U, V-X, Y-Z  / <company folder>   (searched first)
+        -> GROUPS / <company folder>                                        (fallback only)
             -> BIZFILE / BIZNET file
 
-Input : CSV with the client names (column auto-detected or --name-column).
-Output: CSV with status, folder link, bizfile link per client.
+Input : the client CSV (same layout as the Google Sheet:
+        Client Name | Status | Connected folder link).
+Output: same three columns first (same order, same row order, ready to paste back),
+        then details: check_result, found_in, matched_path, bizfile, note ...
+        Status = "Done" only when the folder AND the BIZFILE/BIZNET were found with an
+        exact name match; everything else is "not done" and check_result says why.
 
 Usage:
-    python bizfile_finder.py clients.csv --local-root "G:\\Shared drives\\X\\Secretarial Work\\CLIENTS (Corp Sec)\\PTE Company"
-        (Google Drive for Desktop, Stream mode: no credentials.json / token.json)
-    python bizfile_finder.py clients.csv -o results.csv   (Drive API, needs credentials.json)
-    python bizfile_finder.py clients.csv --name-column "Organization Name"
+    python bizfile_finder.py clients.csv --local-root "H:/" -o results.csv        # Drive for Desktop
+    python bizfile_finder.py clients.csv -o results.csv                           # Drive API (credentials.json)
+    python bizfile_finder.py clients.csv --local-root "H:/" --compare             # check against manual Status
 """
 import argparse
 import csv
@@ -41,7 +44,8 @@ def normalize(name: str) -> str:
     s = strip_fy(name).lower().replace("&", " and ")
     s = re.sub(_SUFFIXES, " ", s)
     s = re.sub(r"[^a-z0-9]+", " ", s)
-    return re.sub(r"\s+", " ", s).strip()
+    s = re.sub(r"\s+", " ", s).strip()
+    return re.sub(r"^the ", "", s)
 
 
 FY_RE = re.compile(r"\s*[-–—]?\s*FY\s?(\d{2,4})\s*$", re.I)
@@ -204,6 +208,18 @@ def resolve_pte_root(drive: Drive, shared_drive_id=None, pte_folder_id=None):
 
 ALPHA, GROUPS = "ALPHABETICAL", "GROUPS"
 GROUPS_RE = re.compile(r"^\s*groups?\s*$", re.I)
+RANGE_RE = re.compile(r"^\s*[A-Za-z]\s*[-–]\s*[A-Za-z]\s*$")     # A-C, D-F, ...
+ROMAN_RE = re.compile(r"^[ivx]+$")
+
+
+def confusable(a: str, b: str) -> bool:
+    """True if two normalised names differ only in a distinguishing token (letter, digit,
+    roman numeral): 'sgsupergreen a' vs 'sgsupergreen b', 'tangerine capital i' vs 'ii'.
+    Such pairs are different companies, so fuzzy matching must never join them."""
+    def marks(k):
+        toks = k.split()
+        return sorted(t for t in toks if len(t) == 1 or ROMAN_RE.match(t)) + re.findall(r"\d+", k)
+    return marks(a) != marks(b)
 
 
 def _entry(f, path, location):
@@ -227,9 +243,13 @@ def build_index(drive: Drive, pte_id: str, seen=None):
     found = []
     for top in drive.children(pte_id, folders_only=True):
         is_groups = bool(GROUPS_RE.match(top["name"]))
-        loc = GROUPS if is_groups else ALPHA
         if seen is not None:
             seen.append(top["name"])
+        if not is_groups and not RANGE_RE.match(top["name"]):
+            print(f"warning: ignoring unexpected folder under PTE Company: {top['name']!r}",
+                  file=sys.stderr)
+            continue
+        loc = GROUPS if is_groups else ALPHA
         for f in drive.children(top["id"], folders_only=True):
             path = f"{top['name']}/{f['name']}"
             if seen is not None:
@@ -267,14 +287,19 @@ class Index:
                 if key in pool:
                     return "EXACT", sorted(pool[key], key=lambda e: -fy_of(e["name"]))
             for key in keys:
-                close = difflib.get_close_matches(key, pool, n=1, cutoff=FUZZY_THRESHOLD)
-                if close:
-                    return "FUZZY", sorted(pool[close[0]], key=lambda e: -fy_of(e["name"]))
+                for cand in difflib.get_close_matches(key, pool, n=5, cutoff=FUZZY_THRESHOLD):
+                    if not confusable(key, cand):
+                        return "FUZZY", sorted(pool[cand], key=lambda e: -fy_of(e["name"]))
         return "NONE", []
 
 
 # ------------------------------------------------------------------- driver
-def read_clients(path, column=None, skip_done=False):
+STATUS_DONE, STATUS_TODO = "Done", "not done"
+
+
+def read_rows(path, column=None):
+    """Every CSV row in original order -> (header_name_col, header_status, header_link, rows).
+    Each row: dict(name, status, link, skip)  where skip is '' or a check_result string."""
     with open(path, newline="", encoding="utf-8-sig") as fh:
         rows = list(csv.DictReader(fh))
     if not rows:
@@ -285,44 +310,66 @@ def read_clients(path, column=None, skip_done=False):
         print(f"Using name column: {column!r}", file=sys.stderr)
     elif column not in cols:
         sys.exit(f"Column {column!r} not in CSV. Available: {cols}")
-    status_col = next((c for c in cols if c.strip().lower() == "status"), None)
-    names, seen = [], set()
+    scol = next((c for c in cols if c.strip().lower() == "status"), None)
+    lcol = next((c for c in cols if "link" in c.lower()), None)
+    out, seen = [], set()
     for r in rows:
-        n = r[column].strip()
-        if is_junk(n) or n.lower() in seen:
+        name = (r[column] or "").strip()
+        if not name:
             continue
-        if skip_done and status_col and r[status_col].strip().lower() == "done":
-            continue
-        seen.add(n.lower())
-        names.append(n)
-    return names
+        row = dict(name=name, status=(r.get(scol) or "").strip() if scol else "",
+                   link=(r.get(lcol) or "").strip() if lcol else "", skip="")
+        if is_junk(name):
+            row["skip"] = "SKIPPED_NOT_A_CLIENT"
+        elif name.lower() in seen:
+            row["skip"] = "DUPLICATE"
+        seen.add(name.lower())
+        out.append(row)
+    return column, scol or "Status", lcol or "Connected folder link", out
+
+
+def read_clients(path, column=None, skip_done=False):
+    """Names only (junk/duplicates dropped; optionally rows already 'Done')."""
+    _, _, _, rows = read_rows(path, column)
+    return [r["name"] for r in rows if not r["skip"]
+            and not (skip_done and r["status"].lower() == "done")]
 
 
 def check_client(drive, index, client):
-    res = dict(client=client, status="", match_type="", matched_folder="", matched_path="", location="", found_in="",
-               folder_link="", bizfile_name="", bizfile_link="", note="")
+    res = dict(client=client, check_result="", match_type="", found_in="", matched_folder="",
+               matched_path="", location="", folder_link="", bizfile_name="", bizfile_link="",
+               note="")
     mtype, entries = index.lookup(client)
     if not entries:
-        res["status"] = "NO_FOLDER"
+        res["check_result"] = "NO_FOLDER"
         return res
     top = entries[0]
-    res.update(match_type=mtype, matched_folder=top["name"], matched_path=top["path"], location=top["location"],
-               found_in=top["found_in"],
-               folder_link=top["link"])
+    res.update(match_type=mtype, matched_folder=top["name"], matched_path=top["path"],
+               location=top["location"], found_in=top["found_in"], folder_link=top["link"])
+    notes = []
     if len(entries) > 1:
-        res["note"] = "multiple folders: " + "; ".join(e["path"] for e in entries)
-    # only list the matched folder's files (few API calls, nothing downloaded)
-    files = [f for f in drive.children(top["id"]) if is_bizfile(f["name"])
-             and f["mimeType"] != FOLDER_MIME]
+        notes.append("multiple folders: " + "; ".join(e["path"] for e in entries))
+    # list only the matched folder (few calls, nothing downloaded)
+    kids = list(drive.children(top["id"]))
+    files = [f for f in kids if is_bizfile(f["name"]) and f["mimeType"] != FOLDER_MIME]
+    if not files:  # tolerate BIZFILE/ BIZNET sub-folder
+        for sub in (k for k in kids if k["mimeType"] == FOLDER_MIME and is_bizfile(k["name"])):
+            files += [f for f in drive.children(sub["id"]) if f["mimeType"] != FOLDER_MIME]
+            if files:
+                notes.append(f"bizfile found inside sub-folder {sub['name']!r}")
+                break
     if not files:
-        res["status"] = "NO_BIZFILE"           # flag: bizfile missing
+        res["check_result"] = "NO_BIZFILE"            # flag: bizfile missing
+        res["note"] = " | ".join(notes)
         return res
     files.sort(key=lambda f: f["name"])
     res.update(bizfile_name=files[0]["name"], bizfile_link=files[0].get("webViewLink", ""))
-    res["status"] = "FOUND" if mtype == "EXACT" else "FOUND_FUZZY_REVIEW"
+    res["check_result"] = "FOUND" if mtype == "EXACT" else "FOUND_FUZZY_REVIEW"
+    if mtype != "EXACT":
+        notes.append("name only approximately matches - verify before connecting")
     if len(files) > 1:
-        res["note"] = (res["note"] + " | " if res["note"] else "") + \
-            "multiple bizfiles: " + "; ".join(f["name"] for f in files)
+        notes.append("multiple bizfiles: " + "; ".join(f["name"] for f in files))
+    res["note"] = " | ".join(notes)
     return res
 
 
@@ -333,18 +380,21 @@ def main(argv=None):
     ap.add_argument("-o", "--output", default="bizfile_results.csv")
     ap.add_argument("--name-column")
     ap.add_argument("--skip-done", action="store_true",
-                    help="skip rows whose Status column is already 'Done'")
+                    help="do not re-check rows whose Status is already 'Done'")
+    ap.add_argument("--compare", action="store_true",
+                    help="treat the CSV's Done/not done Status as the manual answer, re-check every "
+                         "row and report where the program disagrees")
     ap.add_argument("--shared-drive-id", help="ID of the shared drive holding 'Secretarial Work'")
     ap.add_argument("--pte-folder-id", help="ID of the 'PTE Company' folder (skips path lookup)")
     ap.add_argument("--dump-folders", metavar="FILE",
                     help="write every folder path visited to FILE (for diagnosing 0 matches)")
-    ap.add_argument("--local-root", help="path to the 'PTE Company' folder as mounted by Google "
-                    "Drive for Desktop (Stream mode). No credentials/token needed.")
+    ap.add_argument("--local-root", help="path to the drive (e.g. H:/) or to the 'PTE Company' folder "
+                    "as mounted by Google Drive for Desktop (Stream mode). No credentials needed.")
     ap.add_argument("--credentials", default="credentials.json", help="OAuth client secrets")
     ap.add_argument("--token", default="token.json")
     a = ap.parse_args(argv)
 
-    clients = read_clients(a.csv, a.name_column, a.skip_done)
+    name_col, status_col, link_col, rows = read_rows(a.csv, a.name_column)
     if a.local_root:
         if not os.path.isdir(a.local_root):
             sys.exit(f"--local-root is not a folder: {a.local_root!r}")
@@ -356,30 +406,69 @@ def main(argv=None):
     print("Indexing folder names (read-only)...", file=sys.stderr)
     seen = []
     index = Index(build_index(drive, pte, seen=seen))
-    n_idx = index.size
-    print(f"Indexed {n_idx} client folders (of {len(seen)} folders seen) "
+    tops = sorted({p.split("/")[0] for p in seen})
+    print(f"Top-level folders: {', '.join(tops)}", file=sys.stderr)
+    print(f"Indexed {index.size} company folders (of {len(seen)} folders seen) "
           f"in {drive.calls} listing calls", file=sys.stderr)
     if a.dump_folders:
         Path(a.dump_folders).write_text("\n".join(seen), encoding="utf-8")
         print(f"Wrote folder names seen to {a.dump_folders}", file=sys.stderr)
-    if n_idx < max(1, len(clients) // 4):
-        print("\nWARNING: very few client folders recognised. Folder names seen "
+    n_todo = sum(1 for r in rows if not r["skip"])
+    if index.size < max(1, n_todo // 4):
+        print("\nWARNING: very few company folders recognised. Folder names seen "
               f"(first 25 of {len(seen)}):", file=sys.stderr)
         for x in seen[:25]:
             print("   ", x, file=sys.stderr)
         print("Expected: PTE Company/<A-C ...>/<company> and PTE Company/GROUPS/<company>. "
-              "Check the 'Using PTE Company folder' line, or use --dump-folders seen.txt.\n", file=sys.stderr)
+              "Check the 'Using PTE Company folder' line, or use --dump-folders.\n", file=sys.stderr)
 
-    results = [check_client(drive, index, c) for c in clients]
-    with open(a.output, "w", newline="", encoding="utf-8") as fh:
-        w = csv.DictWriter(fh, fieldnames=list(results[0].keys()))
-        w.writeheader(); w.writerows(results)
+    fields = [name_col, status_col, link_col, "check_result", "found_in", "matched_folder",
+              "matched_path", "match_type", "bizfile_name", "bizfile_link", "note"]
+    if a.compare:
+        fields += ["manual_status", "agrees"]
+    results, mismatches = [], []
+    for r in rows:
+        manual = r["status"].lower()
+        if r["skip"]:
+            res = dict(client=r["name"], check_result=r["skip"])
+            status, link = r["status"], r["link"]
+        elif r["status"].lower() == "done" and a.skip_done and not a.compare:
+            res = dict(client=r["name"], check_result="SKIPPED_ALREADY_DONE")
+            status, link = r["status"], r["link"]
+        else:
+            res = check_client(drive, index, r["name"])
+            status = STATUS_DONE if res["check_result"] == "FOUND" else STATUS_TODO
+            link = res["folder_link"]
+        row = {name_col: r["name"], status_col: status, link_col: link}
+        for k in fields[3:]:
+            row[k] = res.get(k, "")
+        if a.compare:
+            row["manual_status"] = r["status"]
+            known = manual in ("done", "not done")
+            ok = "" if not known or r["skip"] else ("yes" if manual == status.lower() else "NO")
+            row["agrees"] = ok
+            if ok == "NO":
+                mismatches.append(row)
+        results.append(row)
+
+    with open(a.output, "w", newline="", encoding="utf-8-sig") as fh:   # utf-8-sig: opens cleanly in Excel
+        w = csv.DictWriter(fh, fieldnames=fields)
+        w.writeheader()
+        w.writerows(results)
 
     from collections import Counter
-    for k, v in Counter(r["status"] for r in results).items():
-        print(f"  {k:20s} {v}", file=sys.stderr)
-    print("Found in:", dict(Counter(r["location"] for r in results if r["location"])),
-          file=sys.stderr)
+    print("\nResult", file=sys.stderr)
+    for k, v in Counter(x["check_result"] for x in results).items():
+        print(f"  {k:24s} {v}", file=sys.stderr)
+    print("Found in:", dict(Counter(x["found_in"].split(":")[0].split(" >")[0]
+                                   for x in results if x["found_in"])), file=sys.stderr)
+    if a.compare:
+        cmp_rows = [x for x in results if x["agrees"]]
+        print(f"\nCompare with manual Status: {sum(x['agrees']=='yes' for x in cmp_rows)}/"
+              f"{len(cmp_rows)} agree", file=sys.stderr)
+        for x in mismatches:
+            print(f"  MISMATCH  {x[name_col]!r}: manual={x['manual_status']!r} "
+                  f"program={x[status_col]!r} ({x['check_result']}) {x['note']}", file=sys.stderr)
     print(f"Wrote {a.output}", file=sys.stderr)
 
 
