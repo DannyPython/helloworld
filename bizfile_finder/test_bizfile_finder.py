@@ -36,7 +36,8 @@ def run(client):
 
 def test_alphabetical_without_fy_suffix():
     r = run("ALPHA HOLDINGS PTE. LTD.")
-    assert r["status"] == "FOUND" and r["location"] == ALPHA and r["matched_path"] == "A-C/Alpha Holdings Pte Ltd"
+    assert r["status"] == "FOUND" and r["location"] == ALPHA and r["matched_path"] == "A-C/Alpha Holdings Pte Ltd" \
+        and r["found_in"] == "Alphabetical: A-C"
 
 
 def test_fy_variants_pick_latest_and_note():
@@ -50,8 +51,9 @@ def test_no_bizfile_flagged():
 
 def test_groups_fallback_and_nested():
     z = run("Zeta")
-    assert z["status"] == "FOUND" and z["location"] == GROUPS
-    assert run("Nested Co Pte Ltd")["location"] == GROUPS
+    assert z["status"] == "FOUND" and z["location"] == GROUPS and z["found_in"] == "GROUPS"
+    n = run("Nested Co Pte Ltd")
+    assert n["location"] == GROUPS and n["found_in"] == "GROUPS > Big Group"
 
 
 def test_alphabetical_wins_over_groups():

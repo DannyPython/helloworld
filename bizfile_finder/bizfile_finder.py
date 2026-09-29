@@ -207,7 +207,12 @@ GROUPS_RE = re.compile(r"^\s*groups?\s*$", re.I)
 
 
 def _entry(f, path, location):
-    return dict(id=f["id"], name=f["name"], path=path, location=location,
+    parts = path.split("/")
+    if location == ALPHA:
+        found_in = f"Alphabetical: {parts[0]}"
+    else:
+        found_in = "GROUPS" + (f" > {parts[1]}" if len(parts) > 2 else "")
+    return dict(id=f["id"], name=f["name"], path=path, location=location, found_in=found_in,
                 link=f.get("webViewLink") or f"https://drive.google.com/drive/folders/{f['id']}")
 
 
@@ -294,7 +299,7 @@ def read_clients(path, column=None, skip_done=False):
 
 
 def check_client(drive, index, client):
-    res = dict(client=client, status="", match_type="", matched_folder="", matched_path="", location="",
+    res = dict(client=client, status="", match_type="", matched_folder="", matched_path="", location="", found_in="",
                folder_link="", bizfile_name="", bizfile_link="", note="")
     mtype, entries = index.lookup(client)
     if not entries:
@@ -302,6 +307,7 @@ def check_client(drive, index, client):
         return res
     top = entries[0]
     res.update(match_type=mtype, matched_folder=top["name"], matched_path=top["path"], location=top["location"],
+               found_in=top["found_in"],
                folder_link=top["link"])
     if len(entries) > 1:
         res["note"] = "multiple folders: " + "; ".join(e["path"] for e in entries)
@@ -372,6 +378,8 @@ def main(argv=None):
     from collections import Counter
     for k, v in Counter(r["status"] for r in results).items():
         print(f"  {k:20s} {v}", file=sys.stderr)
+    print("Found in:", dict(Counter(r["location"] for r in results if r["location"])),
+          file=sys.stderr)
     print(f"Wrote {a.output}", file=sys.stderr)
 
 
