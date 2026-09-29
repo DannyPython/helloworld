@@ -202,7 +202,7 @@ def resolve_pte_root(drive: Drive, shared_drive_id=None, pte_folder_id=None):
     return parent
 
 
-def build_index(drive: Drive, pte_id: str, max_depth: int = 3):
+def build_index(drive: Drive, pte_id: str, max_depth: int = 3, seen=None):
     """
     Walk PTE Company -> letter folders / GROUP (folders only, metadata only).
     Returns list of dicts: {id, name, link, location}. A 'client folder' is any
@@ -213,6 +213,8 @@ def build_index(drive: Drive, pte_id: str, max_depth: int = 3):
         pid, trail, depth = stack.pop()
         for f in drive.children(pid, folders_only=True):
             path = f"{trail}/{f['name']}" if trail else f["name"]
+            if seen is not None:
+                seen.append(path)
             if FY_RE.search(f["name"]):
                 loc = "GROUP" if path.upper().startswith(GROUP_FOLDER_NAME) else "ALPHABETICAL"
                 found.append(dict(id=f["id"], name=f["name"], path=path, location=loc,
@@ -305,6 +307,8 @@ def main(argv=None):
                     help="skip rows whose Status column is already 'Done'")
     ap.add_argument("--shared-drive-id", help="ID of the shared drive holding 'Secretarial Work'")
     ap.add_argument("--pte-folder-id", help="ID of the 'PTE Company' folder (skips path lookup)")
+    ap.add_argument("--dump-folders", metavar="FILE",
+                    help="write every folder path visited to FILE (for diagnosing 0 matches)")
     ap.add_argument("--local-root", help="path to the 'PTE Company' folder as mounted by Google "
                     "Drive for Desktop (Stream mode). No credentials/token needed.")
     ap.add_argument("--credentials", default="credentials.json", help="OAuth client secrets")
@@ -321,9 +325,22 @@ def main(argv=None):
         drive = Drive(build_service(a.credentials, a.token))
         pte = resolve_pte_root(drive, a.shared_drive_id, a.pte_folder_id)
     print("Indexing folder names (read-only)...", file=sys.stderr)
-    index = Index(build_index(drive, pte))
-    print(f"Indexed {sum(map(len, index.by_key.values()))} client folders "
-          f"in {drive.calls} API calls", file=sys.stderr)
+    seen = []
+    index = Index(build_index(drive, pte, seen=seen))
+    n_idx = sum(map(len, index.by_key.values()))
+    print(f"Indexed {n_idx} client folders (of {len(seen)} folders seen) "
+          f"in {drive.calls} listing calls", file=sys.stderr)
+    if a.dump_folders:
+        Path(a.dump_folders).write_text("\n".join(seen), encoding="utf-8")
+        print(f"Wrote folder names seen to {a.dump_folders}", file=sys.stderr)
+    if n_idx < max(1, len(clients) // 4):
+        print("\nWARNING: very few client folders recognised. Folder names seen "
+              f"(first 25 of {len(seen)}):", file=sys.stderr)
+        for x in seen[:25]:
+            print("   ", x, file=sys.stderr)
+        print("Client folders are recognised only if the name ends with FY<digits> "
+              "(e.g. 'Acme Pte Ltd - FY12'). Send me the list above or use "
+              "--dump-folders seen.txt.\n", file=sys.stderr)
 
     results = [check_client(drive, index, c) for c in clients]
     with open(a.output, "w", newline="", encoding="utf-8") as fh:
