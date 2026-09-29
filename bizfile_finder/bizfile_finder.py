@@ -141,6 +141,31 @@ class LocalDrive:
                        mimeType=FOLDER_MIME if is_dir else "file")
 
 
+def resolve_local_root(root: str) -> str:
+    """Accept H:\\, H:\\Secretarial Work, ...\\CLIENTS (Corp Sec) or ...\\PTE Company itself."""
+    if os.path.basename(os.path.normpath(root)).lower() == PATH_TO_PTE[-1].lower():
+        return root
+    for i in range(len(PATH_TO_PTE)):
+        cur = root
+        for name in PATH_TO_PTE[i:]:
+            hit = next((e.name for e in _safe_scandir(cur)
+                        if e.is_dir() and e.name.lower() == name.lower()), None)
+            if hit is None:
+                break
+            cur = os.path.join(cur, hit)
+        else:
+            return cur
+    sys.exit(f"Could not find 'PTE Company' under {root!r}. "
+             "Point --local-root at the PTE Company folder itself.")
+
+
+def _safe_scandir(path):
+    try:
+        return list(os.scandir(path))
+    except OSError:
+        return []
+
+
 def build_service(credentials_file, token_file):
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
@@ -290,7 +315,8 @@ def main(argv=None):
     if a.local_root:
         if not os.path.isdir(a.local_root):
             sys.exit(f"--local-root is not a folder: {a.local_root!r}")
-        drive, pte = LocalDrive(), a.local_root
+        drive, pte = LocalDrive(), resolve_local_root(a.local_root)
+        print(f"Using PTE Company folder: {pte}", file=sys.stderr)
     else:
         drive = Drive(build_service(a.credentials, a.token))
         pte = resolve_pte_root(drive, a.shared_drive_id, a.pte_folder_id)

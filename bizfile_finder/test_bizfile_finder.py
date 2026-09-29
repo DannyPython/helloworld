@@ -60,3 +60,10 @@ def test_local_drive(tmp_path):
     assert check_client(d, idx, "Alpha Pte. Ltd.")["status"] == "FOUND"
     z = check_client(d, idx, "Zeta Pte. Ltd.")
     assert z["status"] == "NO_BIZFILE" and z["location"] == "GROUP"
+
+
+def test_resolve_local_root(tmp_path):
+    pte = tmp_path / "Secretarial Work" / "CLIENTS (Corp Sec)" / "PTE Company"
+    pte.mkdir(parents=True)
+    for r in (tmp_path, tmp_path / "Secretarial Work", tmp_path / "Secretarial Work" / "CLIENTS (Corp Sec)", pte):
+        assert resolve_local_root(str(r)) == str(pte)
