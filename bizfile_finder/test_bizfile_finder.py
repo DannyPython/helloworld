@@ -176,7 +176,7 @@ def test_main_sheet_layout_and_compare(tmp_path):
                    "Alpha Pte. Ltd.,Done,\nBeta Pte. Ltd.,not done,\nClient Name,,\n"
                    "Gamma Pte. Ltd.,not done,\nMissing Pte. Ltd.,not done,\n")
     out = tmp_path / "out.csv"
-    main([str(src), "--local-root", str(root), "-o", str(out), "--compare"])
+    main([str(src), "--local-root", str(root), "-o", str(out), "--compare", "--no-cache"])
     rows = list(csv.DictReader(open(out, encoding="utf-8-sig")))
     assert list(rows[0])[:3] == ["Client Name (must remove non current clients)", "Status",
                                  "Connected folder link"]
@@ -223,3 +223,69 @@ def test_prune_skips_below_bizfile_folders():
     assert pruned.calls < full.calls
     r = check_client(Index(build_index(pruned, "pte", prune=True)), "Beta Pte Ltd")
     assert r["check_result"] == "FOUND"                       # bizfile in sub-folder still found
+
+
+def test_checkpoint_stop_resume_equals_full_scan(tmp_path):
+    ck = str(tmp_path / "ck.json")
+    ref = _snapshot(build_index(FakeDrive(tree()), "pte"))
+    calls, info = {"n": 0}, {}
+
+    def stop_after_first_chunk():
+        calls["n"] += 1
+        return calls["n"] > 2
+    part = build_index(FakeDrive(tree()), "pte", checkpoint=ck, should_stop=stop_after_first_chunk,
+                       info=info, chunk=2)
+    assert info["complete"] is False and info["queued"] > 0 and len(part) < len(ref)
+    d2, info2 = FakeDrive(tree()), {}
+    full = build_index(d2, "pte", checkpoint=ck, resume=True, info=info2, chunk=2)
+    assert info2["complete"] is True and _snapshot(full) == ref
+    listed_first = len(ref) + 4   # sanity: resume did not start from scratch
+    assert d2.calls < listed_first + 8
+
+
+def test_match_only_lists_nothing_and_refuses_missing_cache(tmp_path):
+    ck = str(tmp_path / "ck.json")
+    build_index(FakeDrive(tree()), "pte", checkpoint=ck)
+    d, info = FakeDrive(tree()), {}
+    got = build_index(d, "pte", checkpoint=ck, scan=False, info=info)
+    assert d.calls == 0 and info["complete"] and len(got) > 10
+
+
+def test_error_midscan_saves_progress_then_resume_finishes(tmp_path):
+    ck = str(tmp_path / "ck.json")
+    ref = _snapshot(build_index(FakeDrive(tree()), "pte"))
+
+    class Flaky(FakeDrive):
+        n = 0
+
+        def children(self, pid, folders_only=False):
+            Flaky.n += 1
+            if Flaky.n == 6:
+                raise RuntimeError("quota exceeded")
+            return super().children(pid, folders_only)
+    try:
+        build_index(Flaky(tree()), "pte", checkpoint=ck, chunk=1)
+        assert False, "should have raised"
+    except RuntimeError:
+        pass
+    info = {}
+    assert _snapshot(build_index(FakeDrive(tree()), "pte", checkpoint=ck, resume=True, info=info)) == ref
+    assert info["complete"]
+
+
+def test_main_guards_existing_checkpoint_and_marks_partial(tmp_path):
+    root = tmp_path / "PTE Company"
+    (root / "A-C" / "Alpha Pte Ltd").mkdir(parents=True)
+    (root / "A-C" / "Alpha Pte Ltd" / "BIZFILE.pdf").write_text("x")
+    src = tmp_path / "in.csv"
+    src.write_text("Client Name,Status,Connected folder link\nAlpha Pte. Ltd.,,\nGhost Pte. Ltd.,,\n")
+    ck, out = str(tmp_path / "ck.json"), str(tmp_path / "o.csv")
+    main([str(src), "--local-root", str(root), "-o", out, "--cache", ck])
+    try:
+        main([str(src), "--local-root", str(root), "-o", out, "--cache", ck])
+        assert False
+    except SystemExit as e:
+        assert "checkpoint already exists" in str(e)
+    main([str(src), "--local-root", str(root), "-o", out, "--cache", ck, "--resume"])   # complete -> no rescan
+    rows = list(csv.DictReader(open(out, encoding="utf-8-sig")))
+    assert [r["check_result"] for r in rows] == ["FOUND", "NO_FOLDER"]

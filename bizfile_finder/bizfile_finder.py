@@ -28,8 +28,10 @@ import bisect
 import csv
 import difflib
 import heapq
+import json
 import os
 import re
+import signal
 import sys
 import threading
 import time
@@ -283,8 +285,42 @@ def _scan(drive, pid):
     return subs, biz
 
 
+CHECKPOINT_VERSION = 1
+
+
+def _save_checkpoint(path, root_id, entries, seen, visited, heap, scanned):
+    """Atomically write the whole scan state (index + queue of folders still to list)."""
+    pos = {id(e): i for i, e in enumerate(entries)}
+    data = dict(version=CHECKPOINT_VERSION, root=root_id, scanned=scanned, complete=not heap,
+                entries=entries, seen=seen, visited=sorted(visited),
+                frontier=[[c, t, fid, parts, pos.get(id(e), -1)] for c, t, fid, parts, e in heap])
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def _load_checkpoint(path, root_id):
+    """-> (entries, seen, visited, heap, scanned) or None if absent/for another root/unreadable."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            d = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if d.get("version") != CHECKPOINT_VERSION or d.get("root") != root_id:
+        print(f"warning: {path} belongs to a different folder/version - ignoring it", file=sys.stderr)
+        return None
+    entries = d["entries"]
+    for e in entries:
+        e["bizfiles"] = [tuple(b) for b in e["bizfiles"]]
+    heap = [(c, t, fid, parts, entries[i] if i >= 0 else None) for c, t, fid, parts, i in d["frontier"]]
+    heapq.heapify(heap)
+    return entries, d["seen"], set(d["visited"]), heap, d["scanned"]
+
+
 def build_index(drive, root_id: str, seen=None, max_depth=None, progress_every=0,
-                algo="dijkstra", workers=1, prune=False):
+                algo="dijkstra", workers=1, prune=False, checkpoint=None, checkpoint_every=60,
+                resume=False, scan=True, should_stop=None, info=None, chunk=None):
     """
     Walk EVERY folder below PTE Company (range folders A-C.., GROUPS, anything else, any depth).
     One listing per folder; metadata only, nothing is opened/downloaded.
@@ -293,15 +329,29 @@ def build_index(drive, root_id: str, seen=None, max_depth=None, progress_every=0
     GROUPS themselves are containers, not companies, so they are not indexed.
 
     algo="dijkstra": priority queue keyed by cost = depth (every folder step costs 1), so folders
-        are settled shallowest-first. All folders at the same cost are independent, so they are
-        listed concurrently by `workers` threads - that is where the speed-up comes from
-        (listing latency, not traversal order, is the bottleneck).
-    algo="dfs": the old depth-first order (kept for comparison).
-    prune=True: do not descend below a folder that directly contains a BIZFILE/BIZNET file
-        (a company folder's own sub-folders - Tax, Accounts, years... - hold no other clients).
+        are settled shallowest-first. Folders at the same cost are independent, so they are listed
+        concurrently by `workers` threads - that is where the speed-up comes from (listing
+        latency, not traversal order, is the bottleneck).
+    algo="dfs": the old depth-first order (kept for comparison; no checkpointing).
+    prune=True: do not descend below a folder that directly contains a BIZFILE/BIZNET file.
+
+    Checkpointing (dijkstra only): with `checkpoint=<file>` the full state - index so far AND the
+    queue of folders still to list - is saved every `checkpoint_every` seconds, when `should_stop()`
+    turns true, on Ctrl+C/any error, and at the end. `resume=True` continues from that file;
+    `scan=False` loads it as-is and lists nothing more. info["complete"] tells if the walk finished.
     """
     entries, visited, t0 = [], {root_id}, time.time()
-    state = dict(scanned=0)
+    heap = [(0, "", root_id, [], None)]        # (cost, tie-break, folder id, path parts, entry)
+    seen_paths, scanned = [], 0
+    if checkpoint and algo != "dfs" and (resume or not scan):
+        st = _load_checkpoint(checkpoint, root_id)
+        if st:
+            entries, seen_paths, visited, heap, scanned = st
+            print(f"Loaded checkpoint: {len(entries)} folders indexed, {scanned} listed, "
+                  f"{len(heap)} still queued", file=sys.stderr)
+        elif not scan:
+            sys.exit(f"No usable checkpoint at {checkpoint!r}")
+    state = dict(scanned=scanned, done_now=0)
 
     def visit(item, subs, biz):
         """Apply one finished listing; return the child work items to schedule."""
@@ -309,8 +359,10 @@ def build_index(drive, root_id: str, seen=None, max_depth=None, progress_every=0
         if entry is not None:
             entry["bizfiles"].extend(biz)
         state["scanned"] += 1
+        state["done_now"] += 1
         if progress_every and state["scanned"] % progress_every == 0:
-            print(f"  ... {state['scanned']} folders scanned ({time.time() - t0:.0f}s)", file=sys.stderr)
+            print(f"  ... {state['scanned']} folders scanned, {len(heap)} queued "
+                  f"({time.time() - t0:.0f}s)", file=sys.stderr)
         if (max_depth is not None and len(parts) >= max_depth) or (prune and biz):
             return []
         kids = []
@@ -319,8 +371,7 @@ def build_index(drive, root_id: str, seen=None, max_depth=None, progress_every=0
                 continue
             visited.add(k["id"])
             kparts = parts + [k["name"]]
-            if seen is not None:
-                seen.append("/".join(kparts))
+            seen_paths.append("/".join(kparts))
             loc = classify(kparts[0])
             e = None
             if not (len(kparts) == 1 and loc in (ALPHA, GROUPS)):
@@ -329,31 +380,50 @@ def build_index(drive, root_id: str, seen=None, max_depth=None, progress_every=0
             kids.append((len(kparts), "/".join(kparts).lower(), k["id"], kparts, e))
         return kids
 
-    root = (0, "", root_id, [], None)          # (cost, tie-break, folder id, path parts, entry)
+    def save():
+        if checkpoint and algo != "dfs":
+            _save_checkpoint(checkpoint, root_id, entries, seen_paths, visited, heap, state["scanned"])
+
     pool = ThreadPoolExecutor(max_workers=workers) if workers > 1 else None
+    chunk = chunk or max(32, workers * 16)
     try:
         if algo == "dfs":
-            stack = [root]
+            stack = [heap[0]]
             while stack:
                 item = stack.pop()
                 subs, biz = _scan(drive, item[2])
                 stack.extend(reversed(visit(item, subs, biz)))
+            heap.clear()
         else:
-            heap = [root]
-            while heap:
-                cost = heap[0][0]
-                batch = []
-                while heap and heap[0][0] == cost:       # every folder at the minimum cost
+            last_save = time.time()
+            while heap and scan:
+                if should_stop and should_stop():
+                    break
+                cost, batch = heap[0][0], []
+                while heap and heap[0][0] == cost and len(batch) < chunk:   # shallowest-first
                     batch.append(heapq.heappop(heap))
                 ids = [it[2] for it in batch]
-                results = pool.map(lambda pid: _scan(drive, pid), ids) if pool else map(
-                    lambda pid: _scan(drive, pid), ids)
+                try:
+                    results = list(pool.map(lambda pid: _scan(drive, pid), ids)) if pool else [
+                        _scan(drive, pid) for pid in ids]
+                except BaseException:            # Ctrl+C / API error: keep the queue consistent
+                    for it in batch:
+                        heapq.heappush(heap, it)
+                    raise
                 for item, (subs, biz) in zip(batch, results):
                     for kid in visit(item, subs, biz):
                         heapq.heappush(heap, kid)
+                if checkpoint and time.time() - last_save >= checkpoint_every:
+                    save()
+                    last_save = time.time()
     finally:
         if pool:
-            pool.shutdown()
+            pool.shutdown(wait=False, cancel_futures=True)
+        save()
+    if info is not None:
+        info.update(complete=not heap, queued=len(heap), scanned=state["scanned"])
+    if seen is not None:
+        seen.extend(seen_paths)
     return entries
 
 
@@ -496,6 +566,15 @@ def main(argv=None):
                     help="folders listed concurrently (default 8; use 1 to disable parallelism)")
     ap.add_argument("--prune", action="store_true",
                     help="do not descend below a folder that directly contains BIZFILE/BIZNET (faster)")
+    ap.add_argument("--cache", default="bizfile_index.json", metavar="FILE",
+                    help="checkpoint file: the scan is saved here (default bizfile_index.json)")
+    ap.add_argument("--no-cache", action="store_true", help="do not write a checkpoint file")
+    ap.add_argument("--resume", action="store_true",
+                    help="continue the scan from the checkpoint (already-done folders are not re-listed)")
+    ap.add_argument("--fresh", action="store_true", help="ignore/overwrite an existing checkpoint")
+    ap.add_argument("--match-only", action="store_true",
+                    help="use the checkpoint as it is (even if incomplete); list nothing more")
+    ap.add_argument("--checkpoint-every", type=int, default=60, metavar="SEC")
     ap.add_argument("--max-depth", type=int, help="optional safety limit on folder depth below PTE Company")
     ap.add_argument("--dump-folders", metavar="FILE",
                     help="write every folder path visited to FILE (for diagnosing 0 matches)")
@@ -515,10 +594,30 @@ def main(argv=None):
         drive = Drive(build_service(a.credentials, a.token))
         pte = resolve_pte_root(drive, a.shared_drive_id, a.pte_folder_id)
     print("Indexing folder names (read-only)...", file=sys.stderr)
-    seen = []
+    seen, info = [], {}
+    cache = None if (a.no_cache or a.algo == "dfs") else a.cache
+    if cache and os.path.exists(cache) and not (a.resume or a.fresh or a.match_only):
+        sys.exit(f"A checkpoint already exists: {cache}\n"
+                 "  --resume       continue where it stopped (nothing already scanned is repeated)\n"
+                 "  --match-only   just match the CSV against what was scanned so far\n"
+                 "  --fresh        throw it away and start over")
+    stop = {"now": False}
+
+    def on_sigint(signum, frame):
+        stop["now"] = True
+        signal.signal(signal.SIGINT, signal.SIG_DFL)            # a 2nd Ctrl+C aborts immediately
+        print("\nStop requested: finishing the current batch and saving the checkpoint "
+              "(Ctrl+C again = abort now; the last autosave is kept)...", file=sys.stderr)
+    try:
+        signal.signal(signal.SIGINT, on_sigint)
+    except ValueError:                                          # not the main thread
+        pass
     t0 = time.time()
     index = Index(build_index(drive, pte, seen=seen, max_depth=a.max_depth, progress_every=500,
-                              algo=a.algo, workers=max(1, a.workers), prune=a.prune))
+                              algo=a.algo, workers=max(1, a.workers), prune=a.prune,
+                              checkpoint=cache, checkpoint_every=a.checkpoint_every,
+                              resume=a.resume and not a.fresh, scan=not a.match_only,
+                              should_stop=lambda: stop["now"], info=info))
     tops = sorted({p.split("/")[0] for p in seen})
     print(f"Top-level folders: {', '.join(tops)}", file=sys.stderr)
     print(f"Scanned {len(seen)} folders in {drive.calls} listings, {time.time() - t0:.0f}s "
@@ -526,8 +625,15 @@ def main(argv=None):
     if a.dump_folders:
         Path(a.dump_folders).write_text("\n".join(seen), encoding="utf-8")
         print(f"Wrote folder names seen to {a.dump_folders}", file=sys.stderr)
+    partial = not info.get("complete", True)
+    if partial:
+        print(f"\n*** SCAN INCOMPLETE: {info.get('queued', '?')} folders were still queued. ***\n"
+              "    'NOT_FOUND_SO_FAR' below only means 'not seen yet', not 'missing'.", file=sys.stderr)
+        if cache:
+            print(f"    Checkpoint saved to {cache}. Continue later with the same command plus --resume.\n",
+                  file=sys.stderr)
     n_todo = sum(1 for r in rows if not r["skip"])
-    if index.size < max(1, n_todo // 4):
+    if index.size < max(1, n_todo // 4) and not partial:
         print("\nWARNING: very few folders found. Folder names seen "
               f"(first 25 of {len(seen)}):", file=sys.stderr)
         for x in seen[:25]:
@@ -549,6 +655,8 @@ def main(argv=None):
             status, link = r["status"], r["link"]
         else:
             res = check_client(index, r["name"])
+            if partial and res["check_result"] == "NO_FOLDER":
+                res.update(check_result="NOT_FOUND_SO_FAR", note="scan incomplete - may still be found")
             status = STATUS_DONE if res["check_result"] == "FOUND" else STATUS_TODO
             link = res["folder_link"]
         row = {name_col: r["name"], status_col: status, link_col: link}

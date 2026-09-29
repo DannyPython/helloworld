@@ -3,3 +3,4 @@ token.json
 *.csv
 __pycache__/
 *.pyc
+bizfile_index*.json
